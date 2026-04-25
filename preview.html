@@ -683,42 +683,38 @@ const IS_LOCAL_SERVER = location.hostname === 'localhost' || location.hostname =
 
 async function fetchWithFallback(path) {
   const url = apiUrl(path);
+  const enc = encodeURIComponent(url);
 
-  // 策略1: 本地代理（仅在 localhost 通过 server.js 访问时）
+  // 构建代理列表（按可靠性排序）
+  const proxies = [];
+
+  // 本地代理（仅 localhost）
   if (IS_LOCAL_SERVER) {
-    try {
-      const proxyUrl = '/api/pandascore?path=' + encodeURIComponent(path);
-      const r = await fetchTimeout(proxyUrl, 5000);
-      if (r.ok) return await r.json();
-    } catch(e) { console.warn('本地代理失败:', e.message); }
+    proxies.push({ name:'本地代理', fetch: () => fetchTimeout('/api/pandascore?path=' + encodeURIComponent(path), 5000), parse: r => r.json() });
   }
 
-  // 策略2: 直接请求（PandaScore 如果开了 CORS 就能用）
-  try {
-    const r = await fetchTimeout(url, 4000);
-    if (r.ok) return await r.json();
-  } catch(e) { console.warn('直连失败(CORS):', e.message); }
+  // 直连（PandaScore 如果开了 CORS）
+  proxies.push({ name:'直连', fetch: () => fetchTimeout(url, 4000), parse: r => r.json() });
 
-  // 策略3: allorigins.win/raw — 最稳定的免费 CORS 代理
-  try {
-    const r = await fetchTimeout('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), 10000);
-    if (r.ok) return await r.json();
-  } catch(e) { console.warn('allorigins/raw 失败:', e.message); }
+  // allorigins.win/raw
+  proxies.push({ name:'allorigins/raw', fetch: () => fetchTimeout('https://api.allorigins.win/raw?url=' + enc, 12000), parse: r => r.json() });
 
-  // 策略4: corsproxy.io
-  try {
-    const r = await fetchTimeout('https://corsproxy.io/?' + encodeURIComponent(url), 10000);
-    if (r.ok) return await r.json();
-  } catch(e) { console.warn('corsproxy.io 失败:', e.message); }
+  // allorigins.win/get（JSON 包装）
+  proxies.push({ name:'allorigins/get', fetch: () => fetchTimeout('https://api.allorigins.win/get?url=' + enc, 12000), parse: async r => { const w = await r.json(); return JSON.parse(w.contents); } });
 
-  // 策略5: allorigins.win/get JSON 包装（兜底）
-  try {
-    const r = await fetchTimeout('https://api.allorigins.win/get?url=' + encodeURIComponent(url), 12000);
-    if (r.ok) {
-      const wrapper = await r.json();
-      return JSON.parse(wrapper.contents);
-    }
-  } catch(e) { console.warn('allorigins/get 失败:', e.message); }
+  // corsproxy.io
+  proxies.push({ name:'corsproxy.io', fetch: () => fetchTimeout('https://corsproxy.io/?' + enc, 10000), parse: r => r.json() });
+
+  // 逐个尝试
+  for (const p of proxies) {
+    try {
+      const r = await p.fetch();
+      if (r.ok) {
+        const data = await p.parse(r);
+        if (Array.isArray(data)) { console.log('✓', p.name, '成功,', data.length, '条'); return data; }
+      }
+    } catch(e) { console.warn('✗', p.name, '失败:', e.message); }
+  }
 
   throw new Error('所有请求策略均失败');
 }
@@ -925,48 +921,57 @@ const SchedulePage = {
     this.updateSourceBar();
     this.render();
 
+    let allRunning = null, allFinished = null;
+    let source = 'error';
+
+    // ===== 优先: 通过 CORS 代理实时拉取 =====
     try {
-      // 策略1: 从同域 data/matches.json 读取（GitHub Actions 定时更新，无 CORS 问题）
-      let allRunning = null, allFinished = null;
+      const now = new Date();
+      const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      const rangeFrom = sevenDaysAgo.toISOString();
+      const rangeTo = now.toISOString();
+
+      const results = await Promise.all([
+        fetchWithFallback(`/lol/matches?filter[status]=running,not_started&sort=begin_at&per_page=50`),
+        fetchWithFallback(`/lol/matches?filter[status]=finished&range[begin_at]=${rangeFrom},${rangeTo}&sort=-begin_at&per_page=50`)
+      ]);
+      allRunning = results[0];
+      allFinished = results[1];
+      source = 'live';
+      console.log('实时数据加载成功');
+    } catch(e) {
+      console.warn('实时拉取失败:', e.message);
+    }
+
+    // ===== 兜底: 从同域 data/matches.json 读取 =====
+    if (!allRunning) {
       try {
-        const r = await fetchTimeout('data/matches.json?t=' + Date.now(), 5000);
+        const r = await fetchTimeout('data/matches.json?t=' + Date.now(), 8000);
         if (r.ok) {
           const data = await r.json();
           allRunning = data.running || [];
           allFinished = data.finished || [];
-          console.log('从 data/matches.json 加载成功, 更新时间:', data.timestamp);
+          source = 'offline';
+          console.log('从 data/matches.json 兜底加载, 更新时间:', data.timestamp);
         }
-      } catch(e) { console.warn('data/matches.json 加载失败:', e.message); }
+      } catch(e) { console.warn('data/matches.json 也失败:', e.message); }
+    }
 
-      // 策略2: 如果本地 JSON 没有，尝试 CORS 代理实时拉取
-      if (!allRunning) {
-        const now = new Date();
-        const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-        const rangeFrom = sevenDaysAgo.toISOString();
-        const rangeTo = now.toISOString();
-
-        const results = await Promise.all([
-          fetchWithFallback(`/lol/matches?filter[status]=running,not_started&sort=begin_at&per_page=50`),
-          fetchWithFallback(`/lol/matches?filter[status]=finished&range[begin_at]=${rangeFrom},${rangeTo}&sort=-begin_at&per_page=50`)
-        ]);
-        allRunning = results[0];
-        allFinished = results[1];
-      }
-
-      const allApi = [...allRunning, ...allFinished];
+    // ===== 处理数据 =====
+    if (allRunning) {
+      const allApi = [...allRunning, ...(allFinished || [])];
       this.liveMatches = allApi.map(m => this.parseApiMatch(m)).filter(Boolean);
       this.apiLoaded = true;
 
       if (this.liveMatches.length > 0) {
         matches.length = 0;
         this.liveMatches.forEach(am => matches.push(am));
-        this.dataSource = 'live';
+        this.dataSource = source;
       } else {
         this.dataSource = 'offline';
       }
-
-    } catch (err) {
-      console.error('API 拉取失败，使用 mock 数据:', err);
+    } else {
+      console.error('所有数据源均失败');
       this.apiLoaded = false;
       this.dataSource = 'error';
     }
