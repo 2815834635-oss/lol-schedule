@@ -545,6 +545,27 @@ body {
   white-space: nowrap;
 }
 .toast.show { opacity: 1; }
+
+/* 数据源指示器 */
+.data-source-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 5px 12px; background: #fff;
+  border-bottom: 0.5px solid #F0F0F0; flex-shrink: 0;
+}
+.data-source-info { display: flex; align-items: center; gap: 5px; }
+.data-source-dot { width: 6px; height: 6px; border-radius: 50%; }
+.data-source-dot.live { background: #34C759; }
+.data-source-dot.offline { background: #FF9500; }
+.data-source-dot.loading { background: #0A8BFE; animation: pulse 1.5s ease-in-out infinite; }
+.data-source-dot.error { background: #FF3B30; }
+.data-source-text { font-size: 11px; color: #8E8E93; font-weight: 500; }
+.data-source-retry {
+  padding: 3px 10px; background: #F0F0F0; border-radius: 6px;
+  font-size: 11px; color: #0A8BFE; font-weight: 600;
+  cursor: pointer; border: none; transition: all 0.15s ease; user-select: none;
+}
+.data-source-retry:active { transform: scale(0.93); background: #E5E5EA; }
+.data-source-retry.disabled { color: #C7C7CC; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -555,6 +576,13 @@ body {
   <!-- ===== Schedule Page ===== -->
   <div class="page active" id="page-schedule">
     <div class="nav-bar">赛事日程</div>
+    <div class="data-source-bar" id="data-source-bar">
+      <div class="data-source-info">
+        <div class="data-source-dot loading" id="data-source-dot"></div>
+        <span class="data-source-text" id="data-source-text">加载中...</span>
+      </div>
+      <div class="data-source-retry" id="data-source-retry" onclick="SchedulePage.fetchLiveData()">刷新数据</div>
+    </div>
     <div class="region-bar">
       <div class="region-list" id="region-list"></div>
     </div>
@@ -644,16 +672,57 @@ const PANDASCORE = 'https://api.pandascore.co';
 function apiUrl(path) {
   return PANDASCORE + path + (path.includes('?') ? '&' : '?') + 'token=' + API_KEY;
 }
-async function fetchWithFallback(path) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('timeout')), 10000);
-    fetch(apiUrl(path)).then(resp => {
-      clearTimeout(timer);
-      if (!resp.ok) { reject(new Error('HTTP ' + resp.status)); return; }
-      resolve(resp.json());
-    }).catch(e => { clearTimeout(timer); reject(e); });
-  });
+function fetchTimeout(url, ms) {
+  return Promise.race([
+    fetch(url),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))
+  ]);
 }
+// 检测运行环境
+const IS_LOCAL_SERVER = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+
+async function fetchWithFallback(path) {
+  const url = apiUrl(path);
+
+  // 策略1: 本地代理（仅在 localhost 通过 server.js 访问时）
+  if (IS_LOCAL_SERVER) {
+    try {
+      const proxyUrl = '/api/pandascore?path=' + encodeURIComponent(path);
+      const r = await fetchTimeout(proxyUrl, 5000);
+      if (r.ok) return await r.json();
+    } catch(e) { console.warn('本地代理失败:', e.message); }
+  }
+
+  // 策略2: 直接请求（PandaScore 如果开了 CORS 就能用）
+  try {
+    const r = await fetchTimeout(url, 4000);
+    if (r.ok) return await r.json();
+  } catch(e) { console.warn('直连失败(CORS):', e.message); }
+
+  // 策略3: allorigins.win/raw — 最稳定的免费 CORS 代理
+  try {
+    const r = await fetchTimeout('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), 10000);
+    if (r.ok) return await r.json();
+  } catch(e) { console.warn('allorigins/raw 失败:', e.message); }
+
+  // 策略4: corsproxy.io
+  try {
+    const r = await fetchTimeout('https://corsproxy.io/?' + encodeURIComponent(url), 10000);
+    if (r.ok) return await r.json();
+  } catch(e) { console.warn('corsproxy.io 失败:', e.message); }
+
+  // 策略5: allorigins.win/get JSON 包装（兜底）
+  try {
+    const r = await fetchTimeout('https://api.allorigins.win/get?url=' + encodeURIComponent(url), 12000);
+    if (r.ok) {
+      const wrapper = await r.json();
+      return JSON.parse(wrapper.contents);
+    }
+  } catch(e) { console.warn('allorigins/get 失败:', e.message); }
+
+  throw new Error('所有请求策略均失败');
+}
+
 const teamColors = {
   TES:'#DC3232', BLG:'#4285F4', JDG:'#C8A951', EDG:'#0a0a0a',
   LNG:'#0078C8', WE:'#B41E1E', T1:'#DC2828', GenG:'#FFC800',
@@ -744,6 +813,14 @@ const aiRecommendations = [
     description:'LCK 2026 HLE vs DK，Chovy 阿狸教科书级对线' }
 ];
 
+// 动态更新 mock 数据日期（确保 fallback 数据看起来新鲜）
+(function() {
+  const t = new Date(), td = t.toISOString().slice(0,10);
+  const y = new Date(t); y.setDate(t.getDate()-1);
+  const yd = y.toISOString().slice(0,10);
+  matches.forEach(m => { m.date = m.status === 'live' ? td : yd; });
+})();
+
 // ====== 工具函数 ======
 const WK = 'lol_watchlist';
 function getWL() { try { return JSON.parse(localStorage.getItem(WK)) || {want:[],watching:[],watched:[]}; } catch(e) { return {want:[],watching:[],watched:[]}; } }
@@ -805,6 +882,26 @@ const SchedulePage = {
   liveMatches: [],   // API 拉取的实时数据
   loading: false,
   apiLoaded: false,
+  dataSource: 'loading', // 'live' | 'offline' | 'loading' | 'error'
+
+  updateSourceBar() {
+    const dot = document.getElementById('data-source-dot');
+    const text = document.getElementById('data-source-text');
+    const btn = document.getElementById('data-source-retry');
+    if (!dot || !text || !btn) return;
+
+    dot.className = 'data-source-dot ' + this.dataSource;
+    btn.className = 'data-source-retry' + (this.loading ? ' disabled' : '');
+    btn.textContent = this.loading ? '加载中...' : '刷新数据';
+
+    const labels = {
+      live: '实时数据',
+      offline: '离线数据（mock）',
+      loading: '加载中...',
+      error: '加载失败'
+    };
+    text.textContent = labels[this.dataSource] || '未知';
+  },
 
   init() {
     const list = document.getElementById('region-list');
@@ -824,6 +921,8 @@ const SchedulePage = {
 
   async fetchLiveData() {
     this.loading = true;
+    this.dataSource = 'loading';
+    this.updateSourceBar();
     this.render();
 
     const now = new Date();
@@ -841,15 +940,22 @@ const SchedulePage = {
       this.liveMatches = allApi.map(m => this.parseApiMatch(m)).filter(Boolean);
       this.apiLoaded = true;
 
-      matches.length = 0;
-      this.liveMatches.forEach(am => matches.push(am));
+      if (this.liveMatches.length > 0) {
+        matches.length = 0;
+        this.liveMatches.forEach(am => matches.push(am));
+        this.dataSource = 'live';
+      } else {
+        this.dataSource = 'offline';
+      }
 
     } catch (err) {
       console.error('API 拉取失败，使用 mock 数据:', err);
       this.apiLoaded = false;
+      this.dataSource = 'error';
     }
 
     this.loading = false;
+    this.updateSourceBar();
     this.render();
   },
 
