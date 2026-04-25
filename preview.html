@@ -925,18 +925,35 @@ const SchedulePage = {
     this.updateSourceBar();
     this.render();
 
-    const now = new Date();
-    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-    const rangeFrom = sevenDaysAgo.toISOString();
-    const rangeTo = now.toISOString();
-
     try {
-      const results = await Promise.all([
-        fetchWithFallback(`/lol/matches?filter[status]=running,not_started&sort=begin_at&per_page=50`),
-        fetchWithFallback(`/lol/matches?filter[status]=finished&range[begin_at]=${rangeFrom},${rangeTo}&sort=-begin_at&per_page=50`)
-      ]);
+      // 策略1: 从同域 data/matches.json 读取（GitHub Actions 定时更新，无 CORS 问题）
+      let allRunning = null, allFinished = null;
+      try {
+        const r = await fetchTimeout('data/matches.json?t=' + Date.now(), 5000);
+        if (r.ok) {
+          const data = await r.json();
+          allRunning = data.running || [];
+          allFinished = data.finished || [];
+          console.log('从 data/matches.json 加载成功, 更新时间:', data.timestamp);
+        }
+      } catch(e) { console.warn('data/matches.json 加载失败:', e.message); }
 
-      const allApi = [...results[0], ...results[1]];
+      // 策略2: 如果本地 JSON 没有，尝试 CORS 代理实时拉取
+      if (!allRunning) {
+        const now = new Date();
+        const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        const rangeFrom = sevenDaysAgo.toISOString();
+        const rangeTo = now.toISOString();
+
+        const results = await Promise.all([
+          fetchWithFallback(`/lol/matches?filter[status]=running,not_started&sort=begin_at&per_page=50`),
+          fetchWithFallback(`/lol/matches?filter[status]=finished&range[begin_at]=${rangeFrom},${rangeTo}&sort=-begin_at&per_page=50`)
+        ]);
+        allRunning = results[0];
+        allFinished = results[1];
+      }
+
+      const allApi = [...allRunning, ...allFinished];
       this.liveMatches = allApi.map(m => this.parseApiMatch(m)).filter(Boolean);
       this.apiLoaded = true;
 

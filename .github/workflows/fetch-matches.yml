@@ -1,0 +1,46 @@
+name: Fetch LoL Matches Data
+
+on:
+  schedule:
+    # 每10分钟运行一次
+    - cron: '*/10 * * * *'
+  workflow_dispatch: # 允许手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  fetch-data:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch matches from PandaScore API
+        run: |
+          mkdir -p data
+
+          API_KEY="ZvUEIwDlqCQ65wtI2RII_4klHEs42B-2F5zNQkZXquybECZETqo"
+          BASE="https://api.pandascore.co"
+
+          # 获取正在进行和即将开始的比赛
+          RUNNING=$(curl -sf "${BASE}/lol/matches?filter[status]=running,not_started&sort=begin_at&per_page=50&token=${API_KEY}" || echo "[]")
+
+          # 获取最近7天已结束的比赛
+          RANGE_FROM=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-7d +%Y-%m-%dT%H:%M:%SZ)
+          RANGE_TO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          FINISHED=$(curl -sf "${BASE}/lol/matches?filter[status]=finished&range[begin_at]=${RANGE_FROM},${RANGE_TO}&sort=-begin_at&per_page=50&token=${API_KEY}" || echo "[]")
+
+          # 合并为一个 JSON 文件，加上时间戳
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "{\"timestamp\":\"${TIMESTAMP}\",\"running\":${RUNNING},\"finished\":${FINISHED}}" > data/matches.json
+
+          echo "Data fetched at ${TIMESTAMP}"
+          echo "Running/upcoming: $(echo $RUNNING | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))' 2>/dev/null || echo '?') matches"
+          echo "Finished: $(echo $FINISHED | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))' 2>/dev/null || echo '?') matches"
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/matches.json
+          git diff --staged --quiet || (git commit -m "chore: update matches data $(date -u +%H:%M)" && git push)
