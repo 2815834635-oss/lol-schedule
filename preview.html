@@ -669,8 +669,17 @@ body {
 // ====== 数据层 ======
 const API_KEY = 'ZvUEIwDlqCQ65wtI2RII_4klHEs42B-2F5zNQkZXquybECZETqo';
 const PANDASCORE = 'https://api.pandascore.co';
+
+// ★★★ 你的 Cloudflare Worker 代理地址 ★★★
+// 部署 worker/cors-proxy.js 后，把 URL 填到这里
+// 例如: 'https://lol-proxy.你的用户名.workers.dev'
+const WORKER_PROXY = '';
+
 function apiUrl(path) {
   return PANDASCORE + path + (path.includes('?') ? '&' : '?') + 'token=' + API_KEY;
+}
+function workerUrl(path) {
+  return WORKER_PROXY + path + (path.includes('?') ? '&' : '?') + 'token=' + API_KEY;
 }
 function fetchTimeout(url, ms) {
   return Promise.race([
@@ -687,6 +696,11 @@ async function fetchWithFallback(path) {
 
   // 构建代理列表（按可靠性排序）
   const proxies = [];
+
+  // ★ 最高优先：自有 Cloudflare Worker 代理（最稳定）
+  if (WORKER_PROXY) {
+    proxies.push({ name:'CF Worker', fetch: () => fetchTimeout(workerUrl(path), 8000), parse: r => r.json() });
+  }
 
   // 本地代理（仅 localhost）
   if (IS_LOCAL_SERVER) {
