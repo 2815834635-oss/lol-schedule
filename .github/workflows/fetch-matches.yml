@@ -2,9 +2,8 @@ name: Fetch LoL Matches Data
 
 on:
   schedule:
-    # 每10分钟运行一次
     - cron: '*/10 * * * *'
-  workflow_dispatch: # 允许手动触发
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -17,26 +16,58 @@ jobs:
 
       - name: Fetch matches from PandaScore API
         run: |
-          mkdir -p data
+          python3 << 'PYEOF'
+          import urllib.request, json, os
+          from datetime import datetime, timedelta, timezone
 
-          API_KEY="ZvUEIwDlqCQ65wtI2RII_4klHEs42B-2F5zNQkZXquybECZETqo"
-          BASE="https://api.pandascore.co"
+          API_KEY = "ZvUEIwDlqCQ65wtI2RII_4klHEs42B-2F5zNQkZXquybECZETqo"
+          BASE = "https://api.pandascore.co"
 
-          # 获取正在进行和即将开始的比赛
-          RUNNING=$(curl -sf "${BASE}/lol/matches?filter[status]=running,not_started&sort=begin_at&per_page=50&token=${API_KEY}" || echo "[]")
+          def api_fetch(path):
+              url = BASE + path + ("&" if "?" in path else "?") + "token=" + API_KEY
+              req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "LoL-Schedule-Bot/1.0"})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      data = json.loads(r.read())
+                      if isinstance(data, list):
+                          return data
+              except Exception as e:
+                  print(f"  请求失败: {path[:60]}... -> {e}")
+              return []
 
-          # 获取最近7天已结束的比赛
-          RANGE_FROM=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-7d +%Y-%m-%dT%H:%M:%SZ)
-          RANGE_TO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          FINISHED=$(curl -sf "${BASE}/lol/matches?filter[status]=finished&range[begin_at]=${RANGE_FROM},${RANGE_TO}&sort=-begin_at&per_page=50&token=${API_KEY}" || echo "[]")
+          now = datetime.now(timezone.utc)
+          seven_days_ago = now - timedelta(days=7)
+          rf = seven_days_ago.strftime("%Y-%m-%dT%H:%M:%SZ")
+          rt = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+          ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-          # 合并为一个 JSON 文件，加上时间戳
-          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          echo "{\"timestamp\":\"${TIMESTAMP}\",\"running\":${RUNNING},\"finished\":${FINISHED}}" > data/matches.json
+          print("Fetching running/upcoming...")
+          running = api_fetch("/lol/matches?filter[status]=running,not_started&sort=begin_at&per_page=50")
+          print(f"  -> {len(running)} matches")
 
-          echo "Data fetched at ${TIMESTAMP}"
-          echo "Running/upcoming: $(echo $RUNNING | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))' 2>/dev/null || echo '?') matches"
-          echo "Finished: $(echo $FINISHED | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))' 2>/dev/null || echo '?') matches"
+          print("Fetching finished...")
+          finished = api_fetch(f"/lol/matches?filter[status]=finished&range[begin_at]={rf},{rt}&sort=-begin_at&per_page=50")
+          print(f"  -> {len(finished)} matches")
+
+          # 安全检查：如果两个都是空的，不覆盖旧数据
+          if len(running) == 0 and len(finished) == 0:
+              print("WARNING: 两个接口都返回空数据，保留旧文件不覆盖")
+              # 检查旧文件是否存在且有数据
+              if os.path.exists("data/matches.json"):
+                  with open("data/matches.json", "r") as f:
+                      old = json.load(f)
+                      old_total = len(old.get("running",[])) + len(old.get("finished",[]))
+                      print(f"  旧文件有 {old_total} 条数据，保留")
+              exit(0)
+
+          os.makedirs("data", exist_ok=True)
+          result = {"timestamp": ts, "running": running, "finished": finished}
+          with open("data/matches.json", "w", encoding="utf-8") as f:
+              json.dump(result, f, ensure_ascii=False)
+
+          total = len(running) + len(finished)
+          print(f"Done: {total} matches saved at {ts}")
+          PYEOF
 
       - name: Commit and push if changed
         run: |
